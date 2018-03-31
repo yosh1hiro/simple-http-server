@@ -11,6 +11,7 @@
 static void install_signal_handlers(void);
 static void trap_signal(int sig, sighandler_t handler);
 static void signal_exit(int sig);
+static void service(FILE *in, FILE *out, char *docroot);
 static void* xmalloc(size_t sz);
 static void log_exit(char *fmt, ...);
 
@@ -42,6 +43,14 @@ static void trap_signal(int sig, sighandler_t handler) {
 
 static void signal_exit(int sig) {
   log_exit("exit by signal %d", sig);
+}
+
+static void service(FILE *in, FILE *out, char *docroot) {
+  struct HTTPRequest *req;
+
+  req = read_request(in);
+  respond_to(req, out, docroot);
+  free_request(req);
 }
 
 static void* xmalloc(size_t sz) {
