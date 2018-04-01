@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -21,6 +22,12 @@ struct HTTPRequest {
   long length;
 };
 
+struct FileInfo {
+  char *path;
+  long size;
+  int ok;
+};
+
 /* Function Prototypes */
 
 static void install_signal_handlers(void);
@@ -34,6 +41,9 @@ static void upcase(char *str);
 static void free_request(struct HTTPRequest *req);
 static long content_length(struct HTTPRequest *req);
 static char* lookup_header_field_value(struct HTTPRequest *req, char *name);
+static struct FileInfo* get_fileinfo(char *docroot, char *urlpath);
+static char* build_fspath(char *docroot, char *urlpath);
+static void free_fileinfo(struct FileInfo *info);
 static void* xmalloc(size_t sz);
 static void log_exit(char *fmt, ...);
 
@@ -194,6 +204,33 @@ static char* lookup_header_field_value(struct HTTPRequest *req, char *name) {
         return h->value;
   }
   return NULL;
+}
+
+static struct FileInfo* get_fileinfo(char *docroot, char *urlpath) {
+  struct FileInfo *info;
+  struct stat st;
+
+  info = xmalloc(sizeof(struct FileInfo));
+  info->path = build_fspath(docroot, urlpath);
+  info->ok = 0;
+  if (lstat(info->path, &st) < 0) return info;
+  if (!S_ISREG(st.st_mode)) return info;
+  info->ok = 1;
+  info->size = st.st_size;
+  return info;
+} 
+
+static char* build_fspath(char *docroot, char *urlpath) {
+  char *path;
+
+  path = xmalloc(strlen(docroot) + 1 + strlen(urlpath) + 1);
+  sprintf(path, "%s%s", docroot, urlpath);
+  return path;
+}
+
+static void free_fileinfo(struct FileInfo *info) {
+  free(info->path);
+  free(info);
 }
 
 static void* xmalloc(size_t sz) {
