@@ -1,9 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <signal.h>
 
 /* Constants */
@@ -41,6 +47,7 @@ struct FileInfo {
 
 /* Function Prototypes */
 
+typedef void (*sighandler_t)(int);
 static void install_signal_handlers(void);
 static void trap_signal(int sig, sighandler_t handler);
 static void signal_exit(int sig);
@@ -54,10 +61,14 @@ static long content_length(struct HTTPRequest *req);
 static char* lookup_header_field_value(struct HTTPRequest *req, char *name);
 static void respond_to(struct HTTPRequest *req, FILE *out, char *docroot);
 static void do_file_response(struct HTTPRequest *req, FILE *out, char *docroot);
+static void method_not_allowed(struct HTTPRequest *req, FILE *out);
+static void not_implemented(struct HTTPRequest *req, FILE *out);
+static void not_found(struct HTTPRequest *req, FILE *out);
 static void output_common_header_fields(struct HTTPRequest *req, FILE *out, char *status);
 static struct FileInfo* get_fileinfo(char *docroot, char *urlpath);
 static char* build_fspath(char *docroot, char *urlpath);
 static void free_fileinfo(struct FileInfo *info);
+static char* guess_content_type(struct FileInfo *info);
 static void* xmalloc(size_t sz);
 static void log_exit(char *fmt, ...);
 
@@ -106,7 +117,7 @@ static struct HTTPRequest* read_request(FILE *in) {
   req = xmalloc(sizeof(struct HTTPRequest));
   read_request_line(req, in);
   req->header = NULL;
-  while (h = read_header_field(in)) {
+  while ((h = read_header_field(in))) {
     h->next = req->header;
     req->header = h;
   }
@@ -155,7 +166,7 @@ static struct HTTPHeaderField* read_header_field(FILE *in) {
   char *p;
 
   if (!fgets(buf, LINE_BUF_SIZE, in)) {
-    log_exit("failed to read request header field: %s", sterror(errno));
+    log_exit("failed to read request header field: %s", strerror(errno));
   }
   if (buf[0] == '\n' || (strcmp(buf, "\r\n") == 0))
     return NULL;
@@ -206,7 +217,7 @@ static long content_length(struct HTTPRequest *req) {
   val = lookup_header_field_value(req, "Content-Length");
   if (!val) return 0;
   len = atol(val);
-  lif (len < 0) log_exit("negative Content-Length value");
+  if (len < 0) log_exit("negative Content-Length value");
   return len;
 }
 
@@ -249,22 +260,69 @@ static void do_file_response(struct HTTPRequest *req, FILE *out, char *docroot) 
     char buf[BLOCK_BUF_SIZE];
     ssize_t n;
 
-    fd = open(info->path, 0_RDONLY);
+    fd = open(info->path, O_RDONLY);
     if (fd < 0)
-      log_exit("failed to open %s: %s", info->path, sterror(errno));
+      log_exit("failed to open %s: %s", info->path, strerror(errno));
     for (;;) {
       n = read(fd, buf, BLOCK_BUF_SIZE);
       if (n < 0)
-        log_exit("failed to read %s: %s", info->path, sterror(errno));
+        log_exit("failed to read %s: %s", info->path, strerror(errno));
       if (n == 0)
         break;
       if (fwrite(buf, n, 1, out) < n)
-        log_exit("failed to write to socket: %s", sterror(errno));
+        log_exit("failed to write to socket: %s", strerror(errno));
     }
     close(fd);
   }
   fflush(out);
   free_fileinfo(info);
+}
+
+static void method_not_allowed(struct HTTPRequest *req, FILE *out) {
+  output_common_header_fields(req, out, "405 Method Not Allowed");
+  fprintf(out, "Content-Type: text/html\r\n");
+  fprintf(out, "\r\n");
+  fprintf(out, "<html>\r\n");
+  fprintf(out, "<header>\r\n");
+  fprintf(out, "<title>405 Method Not Allowed</title>\r\n");
+  fprintf(out, "<header>\r\n");
+  fprintf(out, "<body\r\n");
+  fprintf(out, "<p>The request method %s is not allowed</p>\r\n", req->method);
+  fprintf(out, "</body>\r\n");
+  fprintf(out, "</html>\r\n");
+  fflush(out);
+}
+
+static void not_implemented(struct HTTPRequest *req, FILE *out) {
+  output_common_header_fields(req, out, "501 Not Implemented");
+  fprintf(out, "Content-Type: text/html\r\n");
+  fprintf(out, "\r\n");
+  fprintf(out, "<html>\r\n");
+  fprintf(out, "<header>\r\n");
+  fprintf(out, "<title>501 Not Implemented</title>\r\n");
+  fprintf(out, "<header>\r\n");
+  fprintf(out, "<body\r\n");
+  fprintf(out, "<p>The request method %s is not implemented</p>\r\n", req->method);
+  fprintf(out, "</body>\r\n");
+  fprintf(out, "</html>\r\n");
+  fflush(out);
+}
+
+static void not_found(struct HTTPRequest *req, FILE *out) {
+  output_common_header_fields(req, out, "404 Not Found");
+  fprintf(out, "Content-Type: text/html\r\n");
+  fprintf(out, "\r\n");
+  if (strcmp(req->method, "HEAD") != 0) {
+    fprintf(out, "<html>\r\n");
+    fprintf(out, "<header>\r\n");
+    fprintf(out, "<title>404 Not Found</title>\r\n");
+    fprintf(out, "<header>\r\n");
+    fprintf(out, "<body\r\n");
+    fprintf(out, "<p>File not found</p>\r\n");
+    fprintf(out, "</body>\r\n");
+    fprintf(out, "</html>\r\n");
+  }
+  fflush(out);
 }
 
 static void output_common_header_fields(struct HTTPRequest *req, FILE *out, char *status) {
@@ -274,7 +332,7 @@ static void output_common_header_fields(struct HTTPRequest *req, FILE *out, char
 
   t = time(NULL);
   tm = gmtime(&t);
-  if (!tm) log_exit("gmtime() failed: %s", sterror(errno));
+  if (!tm) log_exit("gmtime() failed: %s", strerror(errno));
   strftime(buf, TIME_BUF_SIZE, "%a, %d, %b, %Y, %H:%M:%S GMT", tm);
   fprintf(out, "HTTP/1.%d %s\r\n", HTTP_MINOR_VERSION, status);
   fprintf(out, "Date: %s\r\n", buf);
@@ -307,6 +365,10 @@ static char* build_fspath(char *docroot, char *urlpath) {
 static void free_fileinfo(struct FileInfo *info) {
   free(info->path);
   free(info);
+}
+
+static char* guess_content_type(struct FileInfo *info) {
+  return "text/plain";
 }
 
 static void* xmalloc(size_t sz) {
